@@ -1,0 +1,75 @@
+name: track-chrome
+
+# Daily check for a new Chrome stable release. Resolves the version -> Chrome
+# DEPS -> the libjpeg-turbo SHA Chrome ships, bumps REF in build.yml, and tags
+# chrome-<version>, which triggers build.yml.
+#
+# Requires a PAT with `contents: write` stored as TRACK_TOKEN: pushes made with
+# the default GITHUB_TOKEN do not start other workflow runs.
+
+on:
+  schedule:
+    - cron: '27 6 * * *'   # daily ~06:27 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.TRACK_TOKEN }}
+
+      - name: Resolve libjpeg-turbo SHA from the latest Chrome stable
+        id: resolve
+        run: |
+          # Latest Chrome stable (win64). The branch-head equals the BUILD
+          # component (3rd field), e.g. 149.0.7827.156 -> 7827.
+          VERSION=$(curl -fsSL \
+            'https://versionhistory.googleapis.com/v1/chrome/platforms/win64/channels/stable/versions?pageSize=1' \
+            | jq -r '.versions[0].version')
+          BUILD=$(printf '%s' "$VERSION" | cut -d. -f3)
+          echo "Chrome stable: $VERSION (branch-head $BUILD)"
+
+          # Chrome pins libjpeg-turbo inline in DEPS (not via a *_revision var):
+          #   'src/third_party/libjpeg_turbo':
+          #     Var('chromium_git') + '/chromium/deps/libjpeg_turbo.git' + '@' + '<sha>',
+          CDEPS=$(curl -fsSL \
+            "https://chromium.googlesource.com/chromium/src/+/refs/branch-heads/${BUILD}/DEPS?format=TEXT" \
+            | base64 -d)
+
+          NEW=$(printf '%s' "$CDEPS" | grep "libjpeg_turbo.git" | grep -oE "[0-9a-f]{40}" | head -1)
+
+          test -n "$NEW" || { echo "failed to resolve libjpeg-turbo SHA"; exit 1; }
+          echo "Resolved libjpeg-turbo SHA: $NEW"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Bump REF if newer
+        id: bump
+        run: |
+          CURRENT=$(grep -E '^  REF:' .github/workflows/build.yml | awk '{print $2}')
+          NEW="${{ steps.resolve.outputs.sha }}"
+          if [ "$CURRENT" = "$NEW" ]; then
+            echo "libjpeg-turbo already at $CURRENT; nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "s|^  REF: .*|  REF: $NEW|" .github/workflows/build.yml
+          echo "Bumping $CURRENT -> $NEW"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and tag
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          git config user.name "track-chrome bot"
+          git config user.email "actions@github.com"
+          NEW="${{ steps.resolve.outputs.sha }}"
+          VERSION="${{ steps.resolve.outputs.version }}"
+          git commit -am "bump libjpeg-turbo to Chrome $VERSION ($NEW)"
+          git tag "chrome-${VERSION}"
+          git push --follow-tags

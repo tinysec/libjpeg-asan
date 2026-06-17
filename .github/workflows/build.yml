@@ -1,0 +1,178 @@
+name: build
+
+on:
+  push:
+    tags: ["v*", "chrome-*"]
+  workflow_dispatch:
+
+env:
+  # Chrome's libjpeg-turbo fork + the exact SHA Chrome 149 ships. Bumped
+  # automatically by track.yml (resolves latest Chrome stable -> Chrome DEPS).
+  REPO: https://chromium.googlesource.com/chromium/deps/libjpeg_turbo.git
+  REF: d1f5f2393e0d51f840207342ae86e55a86443288
+  UPSTREAM_REPO: https://github.com/libjpeg-turbo/libjpeg-turbo.git
+  AFL_BRANCH: stable
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        engine: [libfuzzer, afl]
+        # AFL++ is Linux-native; there is no Windows AFL++ leg.
+        exclude:
+          - os: windows-latest
+            engine: afl
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git ca-certificates curl \
+            aflplusplus clang
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # clang-cl and cmake are preinstalled on windows-latest.
+          choco install ninja -y --no-progress
+
+      - name: Fetch libjpeg-turbo source (Chrome-locked revision)
+        shell: bash
+        run: |
+          git clone --no-checkout "$REPO" src
+          git -C src fetch --depth 1 origin "$REF"
+          git -C src checkout FETCH_HEAD
+
+      - name: Ensure the fuzz/ harness directory is present
+        shell: bash
+        run: |
+          # The Chrome fork keeps fuzz/ in the vast majority of revisions; if it
+          # is absent, copy fuzz/ from upstream so the native -DWITH_FUZZ=1 build
+          # still produces harness binaries.
+          if [ ! -f src/fuzz/CMakeLists.txt ]; then
+            echo "::notice::fuzz/ missing in the Chrome fork, fetching it from upstream"
+            git clone --depth 1 "$UPSTREAM_REPO" upstream_ljt
+            cp -r upstream_ljt/fuzz src/
+          fi
+
+      - name: Resolve the fuzzing engine and toolchain
+        shell: bash
+        run: |
+          if [ "${{ matrix.engine }}" = "libfuzzer" ]; then
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              # clang-cl fuzzer runtime (supplies main() + coverage for Windows).
+              FUZZ_LIBRARY=""
+              for cand in clang_rt.fuzzer-x86_64.lib libclang_rt.fuzzer-x86_64.lib; do
+                p=$(clang-cl -print-file-name="$cand" 2>/dev/null || true)
+                if [ -n "$p" ] && [ -f "$p" ]; then FUZZ_LIBRARY="$p"; break; fi
+              done
+              test -n "$FUZZ_LIBRARY" || { echo "clang-cl fuzzer runtime not found"; exit 1; }
+              echo "CC=clang-cl" >> "$GITHUB_ENV"
+              echo "CXX=clang-cl" >> "$GITHUB_ENV"
+              # /Zi emits CodeView in the objects; /DEBUG makes the linker write a
+              # side .pdb next to each fuzz target so ASAN stacks resolve to source.
+              echo "ENGINE_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
+              echo "ENGINE_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
+              echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
+            else
+              FUZZ_LIBRARY=$(clang -print-file-name=libclang_rt.fuzzer-x86_64.a)
+              echo "CC=clang" >> "$GITHUB_ENV"
+              echo "CXX=clang++" >> "$GITHUB_ENV"
+              echo "ENGINE_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
+              echo "ENGINE_LDFLAGS=-fsanitize=address" >> "$GITHUB_ENV"
+              echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
+            fi
+          else
+            # AFL++ (Linux only): afl-clang-fast instruments; its driver supplies main().
+            DRIVER=""
+            for p in /usr/lib/afl/afl_driver.o \
+                     /usr/lib/x86_64-linux-gnu/afl/afl_driver.o; do
+              if [ -f "$p" ]; then DRIVER="$p"; break; fi
+            done
+            if [ -z "$DRIVER" ]; then
+              curl -fsSL \
+                "https://raw.githubusercontent.com/AFLplusplus/AFLplusplus/${AFL_BRANCH}/utils/afl_driver.cpp" \
+                -o afl_driver.cpp
+              afl-clang-fast++ -O1 -g afl_driver.cpp -c -o afl_driver.o
+              DRIVER="$PWD/afl_driver.o"
+            fi
+            echo "AFL_USE_ASAN=1" >> "$GITHUB_ENV"
+            echo "CC=afl-clang-fast" >> "$GITHUB_ENV"
+            echo "CXX=afl-clang-fast++" >> "$GITHUB_ENV"
+            echo "ENGINE_CFLAGS=-g -O1" >> "$GITHUB_ENV"
+            echo "ENGINE_LDFLAGS=" >> "$GITHUB_ENV"
+            echo "FUZZ_LIBRARY=$DRIVER" >> "$GITHUB_ENV"
+          fi
+
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build libjpeg-turbo native fuzz targets
+        shell: bash
+        run: |
+          mkdir -p out
+          cmake -S src -B build -G Ninja \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_C_FLAGS_INIT="$ENGINE_CFLAGS" \
+            -DCMAKE_CXX_FLAGS_INIT="$ENGINE_CFLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="$ENGINE_LDFLAGS" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DENABLE_SHARED=0 \
+            -DENABLE_STATIC=1 \
+            -DWITH_TURBOJPEG=0 \
+            -DWITH_SIMD=0 \
+            -DWITH_FUZZ=1 \
+            -DFUZZ_BINDIR="$PWD/out" \
+            -DFUZZ_LIBRARY="$FUZZ_LIBRARY" \
+            -DFUZZER_SUFFIX=""
+          cmake --build build
+
+      - name: Smoke test (one run per target)
+        shell: bash
+        run: |
+          for f in out/*; do
+            case "$f" in *.pdb) continue;; esac   # PDBs are not executables
+            if [ "${{ matrix.engine }}" = "libfuzzer" ]; then
+              "./$f" -runs=1 >/dev/null 2>&1 || true
+            else
+              "./$f" </dev/null >/dev/null 2>&1 || true
+            fi
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jpeg-${{ matrix.engine }}-${{ runner.os }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
