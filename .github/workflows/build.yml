@@ -125,6 +125,17 @@ jobs:
             -DFUZZER_SUFFIX=""
           cmake --build build
 
+          # libjpeg-turbo's fuzz/CMakeLists treats FUZZ_BINDIR as the *install*
+          # destination (install(TARGETS ... RUNTIME DESTINATION ${FUZZ_BINDIR})),
+          # NOT the build output directory, so `cmake --build` leaves the fuzzer
+          # executables under build/fuzz/. A full `cmake --install` would also
+          # try to drop the static lib + headers into a system prefix, so gather
+          # just the fuzzer binaries (and their .pdb sidecars on Windows) into
+          # out/ directly from the build tree.
+          find build -type f \
+            \( -name '*_fuzzer' -o -name '*_fuzzer.exe' -o -name '*_fuzzer.pdb' \) \
+            -exec cp {} out/ \;
+
       - name: Smoke test (one run per target)
         shell: bash
         run: |
