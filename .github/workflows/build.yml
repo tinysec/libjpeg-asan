@@ -108,14 +108,20 @@ jobs:
             # The shared library (libjpeg-*.dll) is ASAN-instrumented, so its
             # link must resolve the static ASAN runtime (__asan_set_shadow_*).
             # clang-cl does not reliably add the STATIC runtime for a DLL, so
-            # provide it explicitly: prepend the runtime dir to LIB (lld-link's
-            # search path) and name the lib in the shared-link flags. We drop
-            # -fsanitize=address from the link so clang-cl does not add a second
-            # (dynamic) runtime alongside our explicit static one.
+            # provide it explicitly as a FULL ABSOLUTE PATH on the link line.
+            # We pass the absolute path (not a bare lib name plus a LIB search
+            # dir) because CMake space-splits linker flags and the runtime's
+            # real home ("C:\Program Files\...") contains a space that breaks
+            # lld-link's name resolution. The GHA workspace has no spaces, so
+            # copy the runtime there first. We drop -fsanitize=address from the
+            # link so clang-cl does not add a second (dynamic) runtime.
             ASAN_RT=$(clang-cl -print-file-name=clang_rt.asan_static-x86_64.lib)
-            ASAN_RTDIR=${ASAN_RT%clang_rt.asan_static-x86_64.lib}
-            echo "LIB=${ASAN_RTDIR};${LIB}" >> "$GITHUB_ENV"
-            echo "ASAN_LDFLAGS=/DEBUG clang_rt.asan_static-x86_64.lib" >> "$GITHUB_ENV"
+            test -f "$ASAN_RT" || { echo "ASAN static runtime not found: $ASAN_RT"; exit 1; }
+            cp "$ASAN_RT" "$GITHUB_WORKSPACE/asan_static_rt.lib"
+            # Forward slashes so the path survives CMake's space-splitting as a
+            # single token; lld-link accepts forward slashes.
+            WS_FWD=$(echo "$GITHUB_WORKSPACE" | sed 's|\\|/|g')
+            echo "ASAN_LDFLAGS=/DEBUG ${WS_FWD}/asan_static_rt.lib" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
