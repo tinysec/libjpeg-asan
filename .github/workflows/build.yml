@@ -44,7 +44,9 @@ jobs:
         run: |
           # Read LIBJPEG_TURBO_VERSION straight from the Chrome fork's header so
           # the build always matches the version Chrome actually ships.
-          HDR=$(curl -fsSL "${FORK_REPO}/+/${{ steps.lock.outputs.sha }}/src/jpeglib.h?format=TEXT" | base64 -d)
+          # LIBJPEG_TURBO_VERSION lives in jconfig.h (jpeglib.h only carries the
+          # IJG JPEG_LIB_VERSION, not the turbo version).
+          HDR=$(curl -fsSL "${FORK_REPO}/+/${{ steps.lock.outputs.sha }}/src/jconfig.h?format=TEXT" | base64 -d)
           LJT_VER=$(printf '%s\n' "$HDR" | sed -nE 's/#define[[:space:]]+LIBJPEG_TURBO_VERSION[[:space:]]+([0-9.]+)/\1/p' | head -1)
           test -n "$LJT_VER" || { echo "could not determine libjpeg-turbo version from fork header"; exit 1; }
           echo "libjpeg_turbo_version=$LJT_VER" >> "$GITHUB_OUTPUT"
