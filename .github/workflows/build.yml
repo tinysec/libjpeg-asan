@@ -24,12 +24,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two matrix dimensions => 4 parallel jobs (os x mode). Each leg ships
-        # one ASAN-instrumented artifact:
+        # Two matrix dimensions => 3 jobs (Windows ships asan only). Each leg
+        # ships one ASAN-instrumented artifact:
         #   asan      -> static + dynamic libraries (link into your own harness)
         #   libfuzzer -> self-contained libFuzzer binaries (libFuzzer engine)
         os: [ubuntu-latest, windows-latest]
         mode: [asan, libfuzzer]
+        exclude:
+          # libjpeg-turbo's UPSTREAM fuzz harnesses (fuzz/cjpeg.cc et al.) are
+          # POSIX: they #include <unistd.h>, which clang-cl/MSVC does not ship.
+          # They do not compile on Windows, so the libFuzzer binaries are built
+          # on Linux only. Windows still ships the ASAN static + dynamic libs
+          # (the primary deliverable for Windows AFL++ fuzzing).
+          - os: windows-latest
+            mode: libfuzzer
 
     steps:
       - name: Checkout this repository
@@ -126,7 +134,7 @@ jobs:
 
             # The shipped Windows LLVM (20.1.x) provides ONLY the DYNAMIC ASAN
             # runtime: clang_rt.asan_dynamic-x86_64.dll + its import lib + the
-            # /MT and /MD CRT thunks. The STATIC clang_rt.asan-x86_64.lib is NOT
+            # DYNAMIC runtime thunk. The STATIC clang_rt.asan-x86_64.lib is NOT
             # shipped for the MSVC ABI, so static-ASAN linking fails with
             # undefined __asan_* symbols. Use the DYNAMIC model. SECOND gotcha:
             # CMake links DLLs/exes via `cmake -E vs_link_* ... lld-link`, NOT
@@ -135,15 +143,20 @@ jobs:
             # auto-linked. It MUST be passed as explicit input libs on every
             # CMake-driven link (libjpeg-*.dll and the fuzz exes).
             # clang_rt.asan_dynamic-x86_64.lib (import lib) resolves __asan_*;
-            # /wholearchive on the /MT CRT thunk forces the ASAN initializer in
-            # so checks run at runtime. Copy the libs into the space-free
-            # workspace (CMake space-splits linker flags and "Program Files" has
-            # a space) and ship the ASAN DLL beside the libraries.
+            # /wholearchive on the DYNAMIC runtime thunk forces the ASAN
+            # initializer + CRT allocator hooks (malloc/free) in so checks run at
+            # runtime. CRITICAL: pair the import lib with asan_DYNAMIC_runtime_thunk,
+            # NOT the static one -- the static thunk double-defines malloc/free
+            # against the dynamic import lib (lld-link: duplicate symbol:
+            # malloc/free), which is what failed jpeg62.dll (jmemmgr.c references
+            # malloc directly). Copy the libs into the space-free workspace
+            # (CMake space-splits linker flags and "Program Files" has a space)
+            # and ship the ASAN DLL beside the libraries.
             LLVM_RT_DIR="C:/Program Files/LLVM/lib/clang"
             ASAN_DYN_IMPORT=""; ASAN_THUNK=""; ASAN_DLL=""
             for d in "$LLVM_RT_DIR"/*/lib/windows; do
               if [ -f "$d/clang_rt.asan_dynamic-x86_64.lib" ]; then ASAN_DYN_IMPORT="$d/clang_rt.asan_dynamic-x86_64.lib"; fi
-              if [ -f "$d/clang_rt.asan_static_runtime_thunk-x86_64.lib" ]; then ASAN_THUNK="$d/clang_rt.asan_static_runtime_thunk-x86_64.lib"; fi
+              if [ -f "$d/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib" ]; then ASAN_THUNK="$d/clang_rt.asan_dynamic_runtime_thunk-x86_64.lib"; fi
               if [ -f "$d/clang_rt.asan_dynamic-x86_64.dll" ]; then ASAN_DLL="$d/clang_rt.asan_dynamic-x86_64.dll"; fi
             done
             if [ -z "$ASAN_DYN_IMPORT" ] || [ -z "$ASAN_THUNK" ]; then
