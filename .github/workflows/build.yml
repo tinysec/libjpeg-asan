@@ -74,6 +74,15 @@ jobs:
         run: |
           git clone --depth 1 --branch "${{ steps.ver.outputs.libjpeg_turbo_version }}" "$UPSTREAM_REPO" src
 
+      # MSVC env is set up BEFORE the toolchain step so that LIB is already
+      # populated when the toolchain step prepends the ASAN runtime directory
+      # to it (lld-link searches LIB for the runtime).
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Resolve the ASAN + libFuzzer toolchain
         shell: bash
         run: |
@@ -82,12 +91,31 @@ jobs:
           #   FUZZ_*  -> libFuzzer pass: ASAN + SanitizerCoverage on the lib
           #              (fuzzer-no-link), and FUZZ_LIBRARY is the libFuzzer
           #              runtime that supplies main() for the fuzz targets.
+          # /MT must live in the flags themselves, not only in
+          # CMAKE_MSVC_RUNTIME_LIBRARY. The runtime-library property applies
+          # to real targets but NOT to CMake's try_compile/check_* probes, so
+          # those probes would otherwise compile with the default /MD. clang-cl
+          # rejects -fsanitize=address under /MD ("ASAN requires static CRT"),
+          # which makes every configure check fail (even stddef.h, a clang
+          # builtin, reports "not found") and trips libjpeg-turbo's
+          # INLINE_WORKS FATAL_ERROR.
           if [ "$RUNNER_OS" = "Windows" ]; then
             echo "CC=clang-cl" >> "$GITHUB_ENV"
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
-            echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi" >> "$GITHUB_ENV"
-            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
-            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
+            echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
+            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
+
+            # The shared library (libjpeg-*.dll) is ASAN-instrumented, so its
+            # link must resolve the static ASAN runtime (__asan_set_shadow_*).
+            # clang-cl does not reliably add the STATIC runtime for a DLL, so
+            # provide it explicitly: prepend the runtime dir to LIB (lld-link's
+            # search path) and name the lib in the shared-link flags. We drop
+            # -fsanitize=address from the link so clang-cl does not add a second
+            # (dynamic) runtime alongside our explicit static one.
+            ASAN_RT=$(clang-cl -print-file-name=clang_rt.asan_static-x86_64.lib)
+            ASAN_RTDIR=${ASAN_RT%clang_rt.asan_static-x86_64.lib}
+            echo "LIB=${ASAN_RTDIR};${LIB}" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=/DEBUG clang_rt.asan_static-x86_64.lib" >> "$GITHUB_ENV"
           else
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
@@ -108,12 +136,6 @@ jobs:
           done
           test -n "$FUZZ_LIBRARY" || { echo "libFuzzer runtime not found"; exit 1; }
           echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
-
-      - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
 
       - name: Build libjpeg-turbo static + dynamic (ASAN)
         if: matrix.mode == 'asan'
