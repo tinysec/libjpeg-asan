@@ -10,9 +10,11 @@ on:
         required: false
 
 env:
-  # Chrome's libjpeg-turbo fork. The Chrome-locked SHA lives in chrome.lock
-  # (written by track.yml) so the default token can push bumps.
-  REPO: https://chromium.googlesource.com/chromium/deps/libjpeg_turbo.git
+  # Chrome's libjpeg-turbo fork SHA lives in chrome.lock (written by track.yml).
+  # The Chrome fork ships only BUILD.gn (no CMakeLists.txt), so we build the
+  # matching UPSTREAM libjpeg-turbo release (read from the fork's jpeglib.h),
+  # which is the exact version Chrome vendors, using its native CMake.
+  FORK_REPO: https://chromium.googlesource.com/chromium/deps/libjpeg_turbo.git
   UPSTREAM_REPO: https://github.com/libjpeg-turbo/libjpeg-turbo.git
 
 jobs:
@@ -36,6 +38,18 @@ jobs:
         run: |
           echo "sha=$(jq -r .sha chrome.lock)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve the libjpeg-turbo release Chrome vendors
+        id: ver
+        shell: bash
+        run: |
+          # Read LIBJPEG_TURBO_VERSION straight from the Chrome fork's header so
+          # the build always matches the version Chrome actually ships.
+          HDR=$(curl -fsSL "${FORK_REPO}/+/${{ steps.lock.outputs.sha }}/src/jpeglib.h?format=TEXT" | base64 -d)
+          LJT_VER=$(printf '%s\n' "$HDR" | sed -nE 's/#define[[:space:]]+LIBJPEG_TURBO_VERSION[[:space:]]+([0-9.]+)/\1/p' | head -1)
+          test -n "$LJT_VER" || { echo "could not determine libjpeg-turbo version from fork header"; exit 1; }
+          echo "libjpeg_turbo_version=$LJT_VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved Chrome libjpeg-turbo version: $LJT_VER"
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -50,24 +64,10 @@ jobs:
           # clang-cl and cmake are preinstalled on windows-latest.
           choco install ninja -y --no-progress
 
-      - name: Fetch libjpeg-turbo source (Chrome-locked revision)
+      - name: Fetch upstream libjpeg-turbo source (Chrome-vendored release)
         shell: bash
         run: |
-          git clone --no-checkout "$REPO" src
-          git -C src fetch --depth 1 origin "${{ steps.lock.outputs.sha }}"
-          git -C src checkout FETCH_HEAD
-
-      - name: Ensure the fuzz/ harness directory is present
-        shell: bash
-        run: |
-          # The Chrome fork keeps fuzz/ in the vast majority of revisions; if it
-          # is absent, copy fuzz/ from upstream so the native -DWITH_FUZZ=1 build
-          # still produces harness binaries.
-          if [ ! -f src/fuzz/CMakeLists.txt ]; then
-            echo "::notice::fuzz/ missing in the Chrome fork, fetching it from upstream"
-            git clone --depth 1 "$UPSTREAM_REPO" upstream_ljt
-            cp -r upstream_ljt/fuzz src/
-          fi
+          git clone --depth 1 --branch "${{ steps.ver.outputs.libjpeg_turbo_version }}" "$UPSTREAM_REPO" src
 
       - name: Resolve the libFuzzer toolchain
         shell: bash
@@ -115,7 +115,7 @@ jobs:
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DENABLE_SHARED=0 \
             -DENABLE_STATIC=1 \
-            -DWITH_TURBOJPEG=0 \
+            -DWITH_TURBOJPEG=1 \
             -DWITH_SIMD=0 \
             -DWITH_FUZZ=1 \
             -DFUZZ_BINDIR="$PWD/out" \
