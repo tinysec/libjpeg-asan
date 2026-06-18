@@ -24,9 +24,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # libFuzzer only. AFL++ (afl-clang-fast) is Linux-native and cannot run
-        # on Windows; Windows AFL++ fuzzing is handled separately via WinAFL.
+        # Two matrix dimensions => 4 parallel jobs (os x mode). Each leg ships
+        # one ASAN-instrumented artifact:
+        #   asan      -> static + dynamic libraries (link into your own harness)
+        #   libfuzzer -> self-contained libFuzzer binaries (libFuzzer engine)
         os: [ubuntu-latest, windows-latest]
+        mode: [asan, libfuzzer]
 
     steps:
       - name: Checkout this repository
@@ -71,32 +74,40 @@ jobs:
         run: |
           git clone --depth 1 --branch "${{ steps.ver.outputs.libjpeg_turbo_version }}" "$UPSTREAM_REPO" src
 
-      - name: Resolve the libFuzzer toolchain
+      - name: Resolve the ASAN + libFuzzer toolchain
         shell: bash
         run: |
+          # Two flag sets:
+          #   ASAN_*  -> library pass: ASAN memory checks only, clean lib.
+          #   FUZZ_*  -> libFuzzer pass: ASAN + SanitizerCoverage on the lib
+          #              (fuzzer-no-link), and FUZZ_LIBRARY is the libFuzzer
+          #              runtime that supplies main() for the fuzz targets.
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # clang-cl fuzzer runtime (supplies main() + coverage for Windows).
-            FUZZ_LIBRARY=""
-            for cand in clang_rt.fuzzer-x86_64.lib libclang_rt.fuzzer-x86_64.lib; do
-              p=$(clang-cl -print-file-name="$cand" 2>/dev/null || true)
-              if [ -n "$p" ] && [ -f "$p" ]; then FUZZ_LIBRARY="$p"; break; fi
-            done
-            test -n "$FUZZ_LIBRARY" || { echo "clang-cl fuzzer runtime not found"; exit 1; }
             echo "CC=clang-cl" >> "$GITHUB_ENV"
             echo "CXX=clang-cl" >> "$GITHUB_ENV"
-            # /Zi emits CodeView in the objects; /DEBUG makes the linker write a
-            # side .pdb next to each fuzz target so ASAN stacks resolve to source.
-            echo "ENGINE_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
-            echo "ENGINE_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
-            echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
+            echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
+            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi" >> "$GITHUB_ENV"
           else
-            FUZZ_LIBRARY=$(clang -print-file-name=libclang_rt.fuzzer-x86_64.a)
             echo "CC=clang" >> "$GITHUB_ENV"
             echo "CXX=clang++" >> "$GITHUB_ENV"
-            echo "ENGINE_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
-            echo "ENGINE_LDFLAGS=-fsanitize=address" >> "$GITHUB_ENV"
-            echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
+            echo "ASAN_CFLAGS=-fsanitize=address -g -O1" >> "$GITHUB_ENV"
+            echo "ASAN_LDFLAGS=-fsanitize=address" >> "$GITHUB_ENV"
+            echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1" >> "$GITHUB_ENV"
           fi
+
+          # Locate the libFuzzer runtime (supplies main() for the fuzz targets).
+          FUZZ_LIBRARY=""
+          for cand in clang_rt.fuzzer-x86_64 libclang_rt.fuzzer-x86_64; do
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              p=$(clang-cl -print-file-name="$cand.lib" 2>/dev/null || true)
+            else
+              p=$(clang -print-file-name=lib$cand.a 2>/dev/null || true)
+            fi
+            if [ -n "$p" ] && [ -f "$p" ]; then FUZZ_LIBRARY="$p"; break; fi
+          done
+          test -n "$FUZZ_LIBRARY" || { echo "libFuzzer runtime not found"; exit 1; }
+          echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
@@ -104,52 +115,102 @@ jobs:
         with:
           arch: x64
 
-      - name: Build libjpeg-turbo native fuzz targets
+      - name: Build libjpeg-turbo static + dynamic (ASAN)
+        if: matrix.mode == 'asan'
         shell: bash
         run: |
-          mkdir -p out
-          cmake -S src -B build -G Ninja \
+          mkdir -p out/lib/include
+          # ENABLE_STATIC=1 + ENABLE_SHARED=1 produce both libraries.
+          # WITH_TURBOJPEG=1 also builds the turbojpeg (TJ) API. WITH_FUZZ=0 so
+          # no fuzzer harness targets are built (we ship libraries only).
+          cmake -S src -B build-asan -G Ninja \
             -DCMAKE_C_COMPILER="$CC" \
             -DCMAKE_CXX_COMPILER="$CXX" \
-            -DCMAKE_C_FLAGS_INIT="$ENGINE_CFLAGS" \
-            -DCMAKE_CXX_FLAGS_INIT="$ENGINE_CFLAGS" \
-            -DCMAKE_EXE_LINKER_FLAGS_INIT="$ENGINE_LDFLAGS" \
+            -DCMAKE_C_FLAGS_INIT="$ASAN_CFLAGS" \
+            -DCMAKE_CXX_FLAGS_INIT="$ASAN_CFLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="$ASAN_LDFLAGS" \
+            -DCMAKE_SHARED_LINKER_FLAGS_INIT="$ASAN_LDFLAGS" \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
-            -DENABLE_SHARED=0 \
             -DENABLE_STATIC=1 \
+            -DENABLE_SHARED=1 \
+            -DWITH_TURBOJPEG=1 \
+            -DWITH_SIMD=0 \
+            -DWITH_FUZZ=0
+          cmake --build build-asan
+
+          # Gather real library files only (-type f skips Linux .so symlinks).
+          find build-asan -type f \( \
+              -name 'libjpeg*.a' -o -name 'libjpeg*.so*' -o \
+              -name 'libturbojpeg*.a' -o -name 'libturbojpeg*.so*' -o \
+              -name 'jpeg*.lib' -o -name 'jpeg*.dll' -o \
+              -name 'turbojpeg*.lib' -o -name 'turbojpeg*.dll' -o \
+              -name '*.pdb' \
+            \) -exec cp {} out/lib/ \;
+
+          # Public headers: jpeglib.h/jmorecfg.h/jerror.h/turbojpeg.h ship in
+          # the source tree; jconfig.h is generated. The consumer's jpeglib.h
+          # #include "jconfig.h", so the generated copy is the one that matters.
+          cp src/jpeglib.h src/jmorecfg.h src/jerror.h src/turbojpeg.h out/lib/include/ 2>/dev/null || true
+          cp build-asan/jconfig.h out/lib/include/ 2>/dev/null || true
+          ls -la out/lib out/lib/include
+
+      - name: Build libjpeg-turbo libFuzzer targets
+        if: matrix.mode == 'libfuzzer'
+        shell: bash
+        run: |
+          mkdir -p out/fuzz
+          # WITH_FUZZ=1 builds the fuzz/ harnesses (LLVMFuzzerTestOneInput) and
+          # links each against the static lib + the libFuzzer runtime
+          # (FUZZ_LIBRARY supplies main()). The lib is compiled with fuzzer
+          # coverage via FUZZ_CFLAGS (fuzzer-no-link).
+          cmake -S src -B build-fuzz -G Ninja \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX" \
+            -DCMAKE_C_FLAGS_INIT="$FUZZ_CFLAGS" \
+            -DCMAKE_CXX_FLAGS_INIT="$FUZZ_CFLAGS" \
+            -DCMAKE_EXE_LINKER_FLAGS_INIT="" \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DENABLE_STATIC=1 \
+            -DENABLE_SHARED=0 \
             -DWITH_TURBOJPEG=1 \
             -DWITH_SIMD=0 \
             -DWITH_FUZZ=1 \
-            -DFUZZ_BINDIR="$PWD/out" \
             -DFUZZ_LIBRARY="$FUZZ_LIBRARY" \
+            -DFUZZ_BINDIR="$PWD/out/fuzz" \
             -DFUZZER_SUFFIX=""
-          cmake --build build
+          cmake --build build-fuzz
 
-          # libjpeg-turbo's fuzz/CMakeLists treats FUZZ_BINDIR as the *install*
-          # destination (install(TARGETS ... RUNTIME DESTINATION ${FUZZ_BINDIR})),
-          # NOT the build output directory, so `cmake --build` leaves the fuzzer
-          # executables under build/fuzz/. A full `cmake --install` would also
-          # try to drop the static lib + headers into a system prefix, so gather
-          # just the fuzzer binaries (and their .pdb sidecars on Windows) into
-          # out/ directly from the build tree.
-          find build -type f \
-            \( -name '*_fuzzer' -o -name '*_fuzzer.exe' -o -name '*_fuzzer.pdb' \) \
-            -exec cp {} out/ \;
+          # FUZZ_BINDIR is the *install* destination, not the build output dir,
+          # so the fuzz exes live under build-fuzz/. Gather them (and .pdb
+          # sidecars) plus the fuzzer dictionaries from the build tree.
+          find build-fuzz -type f \
+            \( -name '*_fuzzer' -o -name '*_fuzzer.exe' -o -name '*_fuzzer.pdb' -o -name '*.dict' \) \
+            -exec cp {} out/fuzz/ \;
+          ls -la out/fuzz
 
-      - name: Smoke test (one run per target)
+      - name: Verify artifacts
         shell: bash
         run: |
-          for f in out/*; do
-            case "$f" in *.pdb) continue;; esac   # PDBs are not executables
-            "./$f" -runs=1 >/dev/null 2>&1 || true
-          done
+          if [ "${{ matrix.mode }}" = "asan" ]; then
+            STAT=$(find out/lib -type f \( -name 'libjpeg*.a' -o -name 'jpeg-static*.lib' -o -name 'jpeg*.lib' \) | head -1)
+            DYN=$(find out/lib -type f \( -name 'libjpeg*.so*' -o -name 'jpeg*.dll' \) | head -1)
+            test -n "$STAT" || { echo "ERROR: ASAN static lib missing"; exit 1; }
+            test -n "$DYN"  || { echo "ERROR: ASAN dynamic lib missing"; exit 1; }
+            echo "asan-static:  $STAT"
+            echo "asan-dynamic: $DYN"
+          else
+            FZ=$(find out/fuzz -type f \( -name '*_fuzzer' -o -name '*_fuzzer.exe' \) | head -1)
+            test -n "$FZ" || { echo "ERROR: libFuzzer binary missing"; exit 1; }
+            echo "libfuzzer: $FZ"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: jpeg-libfuzzer-${{ runner.os }}
-          path: out/*
+          name: jpeg-asan-${{ matrix.mode }}-${{ matrix.os }}
+          path: out
           if-no-files-found: error
 
   release:
