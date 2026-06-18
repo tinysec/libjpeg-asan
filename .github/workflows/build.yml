@@ -140,6 +140,13 @@ jobs:
       - name: Build libjpeg-turbo static + dynamic (ASAN)
         if: matrix.mode == 'asan'
         shell: bash
+        env:
+          # MSYS_NO_PATHCONV stops Git Bash from rewriting the MSVC /-flags
+          # carried in the cmake *_INIT args: without it, /DEBUG (and the like)
+          # becomes "C:/Program Files/Git/DEBUG", corrupting the link flags and
+          # making every configure-time check fail (stdint.h "not found",
+          # INLINE_WORKS - Failed). libpng's cmake steps set the same guard.
+          MSYS_NO_PATHCONV: "1"
         run: |
           mkdir -p out/lib/include
           # ENABLE_STATIC=1 + ENABLE_SHARED=1 produce both libraries.
@@ -180,6 +187,10 @@ jobs:
       - name: Build libjpeg-turbo libFuzzer targets
         if: matrix.mode == 'libfuzzer'
         shell: bash
+        env:
+          # Same MSYS_NO_PATHCONV guard as the ASAN step: protects the MSVC
+          # /-flags in the cmake *_INIT args from Git Bash path conversion.
+          MSYS_NO_PATHCONV: "1"
         run: |
           mkdir -p out/fuzz
           # WITH_FUZZ=1 builds the fuzz/ harnesses (LLVMFuzzerTestOneInput) and
