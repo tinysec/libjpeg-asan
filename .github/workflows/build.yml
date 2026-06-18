@@ -10,10 +10,9 @@ on:
         required: false
 
 env:
-  # Chrome's libjpeg-turbo fork + the exact SHA Chrome 149 ships. Bumped
-  # automatically by track.yml (resolves latest Chrome stable -> Chrome DEPS).
+  # Chrome's libjpeg-turbo fork. The Chrome-locked SHA lives in chrome.lock
+  # (written by track.yml) so the default token can push bumps.
   REPO: https://chromium.googlesource.com/chromium/deps/libjpeg_turbo.git
-  REF: d1f5f2393e0d51f840207342ae86e55a86443288
   UPSTREAM_REPO: https://github.com/libjpeg-turbo/libjpeg-turbo.git
   AFL_BRANCH: stable
 
@@ -35,6 +34,12 @@ jobs:
       - name: Checkout this repository
         uses: actions/checkout@v4
 
+      - name: Read Chrome-locked revision from chrome.lock
+        id: lock
+        shell: bash
+        run: |
+          echo "sha=$(jq -r .sha chrome.lock)" >> "$GITHUB_OUTPUT"
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -54,7 +59,7 @@ jobs:
         shell: bash
         run: |
           git clone --no-checkout "$REPO" src
-          git -C src fetch --depth 1 origin "$REF"
+          git -C src fetch --depth 1 origin "${{ steps.lock.outputs.sha }}"
           git -C src checkout FETCH_HEAD
 
       - name: Ensure the fuzz/ harness directory is present
