@@ -124,28 +124,15 @@ jobs:
             echo "ASAN_CFLAGS=-fsanitize=address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
             echo "FUZZ_CFLAGS=-fsanitize=fuzzer-no-link,address -g -O1 /Zi /MT" >> "$GITHUB_ENV"
 
-            # The shared library (libjpeg-*.dll) is ASAN-instrumented, so its
-            # link must resolve the static ASAN runtime (__asan_set_shadow_*).
-            # clang-cl does not reliably add the STATIC runtime for a DLL, so
-            # provide it explicitly as a FULL ABSOLUTE PATH on the link line.
-            # CMake space-splits linker flags and the runtime's home
-            # ("C:\Program Files\...") contains a space, so copy the runtime
-            # into the space-free GHA workspace and pass its forward-slash
-            # absolute path; lld-link loads an absolute path directly. Try both
-            # Windows runtime names (canonical clang_rt.asan-x86_64.lib and the
-            # _static variant); -print-file-name echoes the query back when the
-            # file is absent, so reject that case.
-            ASAN_RT=""
-            for rtname in clang_rt.asan_static-x86_64.lib clang_rt.asan-x86_64.lib; do
-              cand=$("$CLANG" -print-file-name="$rtname")
-              if [ "$cand" != "$rtname" ] && [ -f "$cand" ]; then
-                ASAN_RT="$cand"; break
-              fi
-            done
-            test -n "$ASAN_RT" || { echo "ASAN static runtime not found via $CLANG"; exit 1; }
-            cp "$ASAN_RT" "$GITHUB_WORKSPACE/asan_static_rt.lib"
-            WS_FWD=$(echo "$GITHUB_WORKSPACE" | sed 's|\\|/|g')
-            echo "ASAN_LDFLAGS=/DEBUG ${WS_FWD}/asan_static_rt.lib" >> "$GITHUB_ENV"
+            # Let clang-cl link the ASAN runtime itself via -fsanitize=address.
+            # The link driver resolves the runtime from its OWN resource dir
+            # (computed from this clang-cl.exe's location), so it always matches
+            # the complete LLVM install -- unlike -print-file-name, which echoes
+            # the bare name back for the MSVC-ABI sanitizer runtimes and is
+            # unreliable here. This is the standard clang-cl ASAN path and
+            # covers the DLL (libjpeg-*.dll). Confirm the files are on disk.
+            ls -la "C:/Program Files/LLVM"/lib/clang/*/lib/windows/ 2>/dev/null | head -40 || true
+            echo "ASAN_LDFLAGS=-fsanitize=address /DEBUG" >> "$GITHUB_ENV"
           else
             CLANG=clang
             echo "CC=clang" >> "$GITHUB_ENV"
@@ -156,16 +143,26 @@ jobs:
           fi
 
           # Locate the libFuzzer runtime (supplies main() for the fuzz targets).
+          # libjpeg-turbo's fuzz/CMakeLists links this archive directly
+          # (target_link_libraries(<t> ${FUZZ_LIBRARY} jpeg-static)) and does NOT
+          # use -fsanitize=fuzzer for linking, so the real file path is needed.
+          # On Windows -print-file-name is unreliable for clang-cl MSVC-ABI
+          # runtimes (echoes the bare name), so glob the LLVM resource dir; on
+          # Linux -print-file-name resolves the .a correctly.
           FUZZ_LIBRARY=""
-          for cand in clang_rt.fuzzer-x86_64 libclang_rt.fuzzer-x86_64; do
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              p=$("$CLANG" -print-file-name="$cand.lib" 2>/dev/null || true)
-            else
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            for pat in \
+              "C:/Program Files/LLVM"/lib/clang/*/lib/windows/clang_rt.fuzzer-x86_64.lib \
+              "C:/Program Files/LLVM"/lib/clang/*/lib/windows/libclang_rt.fuzzer-x86_64.lib; do
+              if [ -f "$pat" ]; then FUZZ_LIBRARY="$pat"; break; fi
+            done
+          else
+            for cand in clang_rt.fuzzer-x86_64 libclang_rt.fuzzer-x86_64; do
               p=$("$CLANG" -print-file-name=lib$cand.a 2>/dev/null || true)
-            fi
-            if [ -n "$p" ] && [ -f "$p" ]; then FUZZ_LIBRARY="$p"; break; fi
-          done
-          test -n "$FUZZ_LIBRARY" || { echo "libFuzzer runtime not found"; exit 1; }
+              if [ -n "$p" ] && [ -f "$p" ]; then FUZZ_LIBRARY="$p"; break; fi
+            done
+          fi
+          test -n "$FUZZ_LIBRARY" || { echo "libFuzzer runtime not found"; ls -la "C:/Program Files/LLVM"/lib/clang/*/lib/windows/ 2>/dev/null; exit 1; }
           echo "FUZZ_LIBRARY=$FUZZ_LIBRARY" >> "$GITHUB_ENV"
 
       - name: Build libjpeg-turbo static + dynamic (ASAN)
