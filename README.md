@@ -12,8 +12,8 @@ ASAN-instrumented build of **Chrome's libjpeg-turbo** — the JPEG codec Chrome 
 version ships (Chrome pins libjpeg-turbo inline in its DEPS). The
 [`track-chrome`](.github/workflows/track.yml) workflow runs every 6 hours: it
 resolves the latest Chrome stable, extracts the libjpeg-turbo SHA from Chrome
-DEPS, and when it has changed it bumps `chrome.lock`, tags `chrome-<version>`,
-and triggers [`build`](.github/workflows/build.yml). Each `chrome-<version>` tag
+DEPS, and when it has changed it bumps `chrome.lock`, tags `libjpeg-turbo-<sha8>`,
+and triggers [`build`](.github/workflows/build.yml). Each `libjpeg-turbo-<sha8>` tag
 becomes a GitHub release.
 
 The build compiles the **upstream libjpeg-turbo release** that matches the
@@ -22,7 +22,7 @@ CMake — the Chrome fork ships only BUILD.gn.
 
 ## Release artifacts
 
-Each release is published at its `chrome-<version>` tag as one **zip per
+Each release is published at its `libjpeg-turbo-<sha8>` tag as one **zip per
 platform and build mode**:
 
 - **ASAN build** (`*-asan-*`): the ASAN **static** libjpeg + libturbojpeg
